@@ -1,8 +1,12 @@
+ 
+# -*- coding: utf-8 -*-
 import requests
 import pandas as pd
 import numpy as np
 from io import StringIO
 from scipy.stats import poisson
+import json
+import os
 
 LEAGUES = {
     "EPL":           ("E0",  "2526"),
@@ -28,7 +32,6 @@ LEAGUES = {
     "Greece Super":  ("G1",  "2526"),
 }
 
-# Исторические данные для H2H (прошлые сезоны)
 H2H_LEAGUES = {
     "EPL":           [("E0","2425"),("E0","2324"),("E0","2223")],
     "Championship":  [("E1","2425"),("E1","2324"),("E1","2223")],
@@ -41,6 +44,8 @@ H2H_LEAGUES = {
     "Jupiler Pro":   [("B1","2425"),("B1","2324"),("B1","2223")],
 }
 
+PENDING_FILE = "C:/football_ai/data/pending_bets.json"
+
 def load_league(code, season):
     url = f"https://www.football-data.co.uk/mmz4281/{season}/{code}.csv"
     r = requests.get(url, timeout=10)
@@ -48,121 +53,126 @@ def load_league(code, season):
     df = df.dropna(subset=["HomeTeam", "FTHG", "FTAG"])
     return df
 
-# ══════════════════════════════════════════════
-#  H2H СТАТИСТИКА
-# ══════════════════════════════════════════════
 def get_h2h(home, away, league, current_df, n=5):
     frames = [current_df]
-
-    # Добавляем прошлые сезоны
     if league in H2H_LEAGUES:
         for code, season in H2H_LEAGUES[league]:
             try:
-                df_old = load_league(code, season)
-                frames.append(df_old)
+                frames.append(load_league(code, season))
             except:
                 pass
-
     all_data = pd.concat(frames, ignore_index=True)
-
-    # Все встречи между командами
     h2h = all_data[
         ((all_data["HomeTeam"] == home) & (all_data["AwayTeam"] == away)) |
         ((all_data["HomeTeam"] == away) & (all_data["AwayTeam"] == home))
     ].tail(n)
-
     if len(h2h) == 0:
         return None
-
-    results = {"home_wins": 0, "draws": 0, "away_wins": 0,
-               "avg_goals": 0, "btts_count": 0, "over25": 0, "matches": []}
-
+    res = {"home_wins":0,"draws":0,"away_wins":0,
+           "avg_goals":0,"btts_count":0,"over25":0,"matches":[]}
     for _, row in h2h.iterrows():
-        hg = int(row["FTHG"])
-        ag = int(row["FTAG"])
-        total = hg + ag
-
-        # Определяем победителя относительно нашего home
+        hg, ag = int(row["FTHG"]), int(row["FTAG"])
+        total  = hg + ag
         if row["HomeTeam"] == home:
-            if hg > ag: results["home_wins"] += 1
-            elif hg == ag: results["draws"] += 1
-            else: results["away_wins"] += 1
-            results["matches"].append(f"{hg}:{ag}")
+            if hg > ag: res["home_wins"] += 1
+            elif hg == ag: res["draws"] += 1
+            else: res["away_wins"] += 1
+            res["matches"].append(f"{hg}:{ag}")
         else:
-            if ag > hg: results["home_wins"] += 1
-            elif hg == ag: results["draws"] += 1
-            else: results["away_wins"] += 1
-            results["matches"].append(f"{ag}:{hg}")
-
-        results["avg_goals"] += total
-        if hg > 0 and ag > 0: results["btts_count"] += 1
-        if total > 2: results["over25"] += 1
-
+            if ag > hg: res["home_wins"] += 1
+            elif hg == ag: res["draws"] += 1
+            else: res["away_wins"] += 1
+            res["matches"].append(f"{ag}:{hg}")
+        res["avg_goals"] += total
+        if hg > 0 and ag > 0: res["btts_count"] += 1
+        if total > 2: res["over25"] += 1
     cnt = len(h2h)
-    results["avg_goals"] = round(results["avg_goals"] / cnt, 2)
-    results["btts_pct"] = round(results["btts_count"] / cnt * 100)
-    results["over25_pct"] = round(results["over25"] / cnt * 100)
-    results["total"] = cnt
+    res["avg_goals"]  = round(res["avg_goals"] / cnt, 2)
+    res["btts_pct"]   = round(res["btts_count"] / cnt * 100)
+    res["over25_pct"] = round(res["over25"] / cnt * 100)
+    res["total"]      = cnt
+    res["xg_adj"]     = round((res["avg_goals"] / 2.5 - 1) * 0.15, 3)
+    res["psych_lock"] = res["home_wins"] == 0 and cnt >= 4
+    return res
 
-    # H2H корректировка xG
-    h2h_xg_adj = round((results["avg_goals"] / 2.5 - 1) * 0.15, 3)
-
-    # Психологический H2H блок — 0 побед в 5 встречах
-    psych_lock = results["home_wins"] == 0 and cnt >= 4
-
-    results["xg_adj"] = h2h_xg_adj
-    results["psych_lock"] = psych_lock
-    return results
-
-def team_stats(df, team, n=6):
-    home = df[df["HomeTeam"] == team].tail(n)
-    away = df[df["AwayTeam"] == team].tail(n)
-    if len(home) == 0 and len(away) == 0:
+def team_stats_split(df, team, n=6):
+    hm = df[df["HomeTeam"] == team].tail(n)
+    am = df[df["AwayTeam"] == team].tail(n)
+    if len(hm) == 0 and len(am) == 0:
         return None
 
-    gf = list(home["FTHG"]) + list(away["FTAG"])
-    ga = list(home["FTAG"]) + list(away["FTHG"])
+    def calc(matches, gf_col, ga_col, sf_col, sa_col, is_home):
+        gf = list(matches[gf_col]) if len(matches) > 0 else []
+        ga = list(matches[ga_col]) if len(matches) > 0 else []
+        try:
+            sf = [x for x in list(matches[sf_col]) if pd.notna(x)]
+            sa = [x for x in list(matches[sa_col]) if pd.notna(x)]
+        except:
+            sf, sa = [], []
+        xg_for = round((np.mean(gf)*0.6 + (np.mean(sf)*0.1 if sf else 0)), 2) if gf else None
+        xg_ag  = round((np.mean(ga)*0.6 + (np.mean(sa)*0.1 if sa else 0)), 2) if ga else None
+        ga_avg = round(np.mean(ga), 2) if ga else 0
+        pts = []
+        for _, row in matches.iterrows():
+            hg, ag = row["FTHG"], row["FTAG"]
+            if is_home:
+                if hg > ag: pts.append(3)
+                elif hg == ag: pts.append(1)
+                else: pts.append(0)
+            else:
+                if ag > hg: pts.append(3)
+                elif hg == ag: pts.append(1)
+                else: pts.append(0)
+        momentum = round(np.mean(pts[-5:]), 2) if pts else 1.0
+        no_goal  = len(gf) >= 2 and gf[-1] == 0 and gf[-2] == 0
+        return {"xg_for":xg_for,"xg_ag":xg_ag,"ga_avg":ga_avg,
+                "momentum":momentum,"no_goal_streak":no_goal,
+                "last5_goals":gf[-5:],"n_matches":len(matches)}
 
-    try:
-        sf = list(home["HST"]) + list(away["AST"])
-        sa = list(home["AST"]) + list(away["HST"])
-        sf = [x for x in sf if pd.notna(x)]
-        sa = [x for x in sa if pd.notna(x)]
-    except:
-        sf, sa = [], []
+    hs  = calc(hm, "FTHG","FTAG","HST","AST", True)
+    as_ = calc(am, "FTAG","FTHG","AST","HST", False)
 
-    xg_for = round((np.mean(gf)*0.6 + (np.mean(sf)*0.1 if sf else 0)), 2) if gf else 1.1
-    xg_ag  = round((np.mean(ga)*0.6 + (np.mean(sa)*0.1 if sa else 0)), 2) if ga else 1.0
-    ga_avg = round(np.mean(ga), 2) if ga else 0
-
-    all_matches = []
-    for _, row in home.iterrows():
-        if row["FTHG"] > row["FTAG"]: all_matches.append(3)
-        elif row["FTHG"] == row["FTAG"]: all_matches.append(1)
-        else: all_matches.append(0)
-    for _, row in away.iterrows():
-        if row["FTAG"] > row["FTHG"]: all_matches.append(3)
-        elif row["FTHG"] == row["FTAG"]: all_matches.append(1)
-        else: all_matches.append(0)
-
-    last5 = all_matches[-5:] if len(all_matches) >= 5 else all_matches
-    momentum = round(np.mean(last5), 2) if last5 else 1.0
-
-    all_goals = list(home["FTHG"]) + list(away["FTAG"])
-    no_goal_streak = len(all_goals) >= 2 and all_goals[-1] == 0 and all_goals[-2] == 0
+    all_pts = []
+    for _, row in hm.iterrows():
+        hg, ag = row["FTHG"], row["FTAG"]
+        if hg > ag: all_pts.append(3)
+        elif hg == ag: all_pts.append(1)
+        else: all_pts.append(0)
+    for _, row in am.iterrows():
+        hg, ag = row["FTHG"], row["FTAG"]
+        if ag > hg: all_pts.append(3)
+        elif hg == ag: all_pts.append(1)
+        else: all_pts.append(0)
+    momentum_all = round(np.mean(all_pts[-5:]), 2) if all_pts else 1.0
+    all_goals    = list(hm["FTHG"]) + list(am["FTAG"])
+    no_goal_all  = len(all_goals) >= 2 and all_goals[-1] == 0 and all_goals[-2] == 0
 
     return {
-        "xg_for": xg_for, "xg_ag": xg_ag, "ga_avg": ga_avg,
-        "momentum": momentum, "no_goal_streak": no_goal_streak,
+        "home": hs, "away": as_,
+        "xg_for": hs["xg_for"] or as_["xg_for"] or 1.1,
+        "xg_ag":  hs["xg_ag"]  or as_["xg_ag"]  or 1.0,
+        "ga_avg": hs["ga_avg"],
+        "momentum": momentum_all,
+        "no_goal_streak": no_goal_all,
         "last5_goals": all_goals[-5:]
     }
 
-def predict(home_xg, away_xg):
+def calc_xg_split(hs, as_):
+    h = hs["home"]
+    a = as_["away"]
+    h_att = h["xg_for"] if h and h["xg_for"] else hs["xg_for"]
+    a_def = a["xg_ag"]  if a and a["xg_ag"]  else as_["xg_ag"]
+    a_att = a["xg_for"] if a and a["xg_for"] else as_["xg_for"]
+    h_def = h["xg_ag"]  if h and h["xg_ag"]  else hs["xg_ag"]
+    return (max(round((h_att + a_def) / 2, 2), 0.3),
+            max(round((a_att + h_def) / 2, 2), 0.3))
+
+def predict(hxg, axg):
     max_g = 6
-    prob = np.zeros((max_g+1, max_g+1))
+    prob  = np.zeros((max_g+1, max_g+1))
     for i in range(max_g+1):
         for j in range(max_g+1):
-            prob[i][j] = poisson.pmf(i, home_xg) * poisson.pmf(j, away_xg)
+            prob[i][j] = poisson.pmf(i, hxg) * poisson.pmf(j, axg)
     p1   = float(np.sum(np.tril(prob, -1)))
     draw = float(np.sum(np.diag(prob)))
     p2   = float(np.sum(np.triu(prob, 1)))
@@ -180,115 +190,137 @@ def predict(home_xg, away_xg):
 def apply_filters(home, away, pos_h, pos_a, odds_p1, odds_p2,
                   total_teams, hs, as_, r, h2h):
     blocks = []
-
     if pos_h <= 2:
-        blocks.append(f"⛔ TABLE LOCK: {home} = {pos_h}-е место (топ-2)")
+        blocks.append(f"STOP TABLE LOCK: {home} = {pos_h} (top-2)")
     if pos_a <= 2:
-        blocks.append(f"⛔ TABLE LOCK: {away} = {pos_a}-е место (топ-2)")
+        blocks.append(f"STOP TABLE LOCK: {away} = {pos_a} (top-2)")
     if pos_h >= total_teams - 2:
-        blocks.append(f"⛔ TABLE LOCK: {home} = {pos_h}-е место (зона вылета)")
+        blocks.append(f"STOP TABLE LOCK: {home} = {pos_h} (relegation)")
     if pos_a >= total_teams - 2:
-        blocks.append(f"⛔ TABLE LOCK: {away} = {pos_a}-е место (зона вылета)")
-
+        blocks.append(f"STOP TABLE LOCK: {away} = {pos_a} (relegation)")
     zone = None
     if odds_p1 > 2.00 and odds_p2 > 2.00:
-        zone = "РАВНОВЕСИЕ"
+        zone = "BALANCE"
         if r["tb25"] >= 0.55:
-            blocks.append(f"⛔ ODDS SYNC: Зона равновесия — только ТМ 3.5, модель даёт ТБ")
+            blocks.append("STOP ODDS SYNC: Balance zone - TM3.5 only")
     elif odds_p1 < 2.00 or odds_p2 < 2.00:
-        zone = "ДОМИНИРОВАНИЕ"
+        zone = "DOMINATION"
         if r["tm35"] >= 0.72 and r["tb15"] < 0.72:
-            blocks.append(f"⛔ ODDS SYNC: Зона доминирования — только ТБ 1.5, модель даёт ТМ")
-
-    underdog_goals = None
+            blocks.append("STOP ODDS SYNC: Domination zone - TB1.5 only, model says TM")
+    underdog = None
     if odds_p1 > 3.0 and hs:
         last3 = hs["last5_goals"][-3:]
         if len(last3) == 3 and all(g > 0 for g in last3):
-            underdog_goals = home
+            underdog = home
     if odds_p2 > 3.0 and as_:
         last3 = as_["last5_goals"][-3:]
         if len(last3) == 3 and all(g > 0 for g in last3):
-            underdog_goals = away
-    if underdog_goals:
-        blocks.append(f"⛔ MOMENTUM: {underdog_goals} (андердог) забивал 3 матча подряд — ТМ запрещён")
-
+            underdog = away
+    if underdog:
+        blocks.append(f"STOP MOMENTUM: {underdog} scored 3 in a row - TM blocked")
     if hs and as_:
         ga_total = hs["ga_avg"] + as_["ga_avg"]
         if ga_total < 2.5:
-            blocks.append(f"⚠ ШЛЮЗ GA: суммарные пропуски {ga_total:.2f} < 2.5 — ТБ/ОЗ ослаблены")
-
+            blocks.append(f"WARN GA GATE: {ga_total:.2f} < 2.5 - TB weakened")
     if hs and hs["no_goal_streak"]:
-        blocks.append(f"⚠ СУХАЯ СЕРИЯ: {home} не забивал 2 матча подряд — ТБ заблокирован")
+        blocks.append(f"WARN DRY RUN: {home} no goals in last 2 matches")
     if as_ and as_["no_goal_streak"]:
-        blocks.append(f"⚠ СУХАЯ СЕРИЯ: {away} не забивал 2 матча подряд — ТБ заблокирован")
-
-    # H2H блоки
+        blocks.append(f"WARN DRY RUN: {away} no goals in last 2 matches")
     if h2h and h2h["psych_lock"]:
-        blocks.append(f"⛔ H2H ПСИХО-БЛОК: {home} — 0 побед в последних {h2h['total']} встречах")
-
+        blocks.append(f"STOP H2H PSYCH: {home} - 0 wins in {h2h['total']} meetings")
     return blocks, zone
 
-def verdict(r, home, away, zone, blocks):
-    lines = []
-    if r["p1"] > 0.50:
-        outcome = f"П1 {home}"
-    elif r["p2"] > 0.50:
-        outcome = f"П2 {away}"
-    elif r["p1"]+r["draw"] > 0.65:
-        outcome = "1Х (П1 или Ничья)"
-    elif r["p2"]+r["draw"] > 0.65:
-        outcome = "Х2 (П2 или Ничья)"
+def auto_save_bet(home, away, league, r, odds_x):
+    if r["tm35"] >= 0.72:
+        bet_type, prob, odds = "TM3.5", r["tm35"], 1.17
+    elif r["tb15"] >= 0.72:
+        bet_type, prob, odds = "TB1.5", r["tb15"], 1.17
+    elif r["btts"] >= 0.60:
+        bet_type, prob, odds = "BTTS",  r["btts"], 1.85
+    elif r["tb25"] >= 0.55:
+        bet_type, prob, odds = "TB2.5", r["tb25"], 1.85
     else:
-        outcome = "1Х (П1 или Ничья)"
+        bet_type, prob, odds = "1X",    r["p1"]+r["draw"], odds_x
+    pending = []
+    if os.path.exists(PENDING_FILE):
+        with open(PENDING_FILE, "r", encoding="utf-8") as f:
+            pending = json.load(f)
+    if not any(e["match"] == f"{home} vs {away}" for e in pending):
+        pending.append({"match":f"{home} vs {away}","league":league,
+                        "bet_type":bet_type,"probability":round(prob,3),
+                        "odds":odds,"result":None})
+        os.makedirs(os.path.dirname(PENDING_FILE), exist_ok=True)
+        with open(PENDING_FILE, "w", encoding="utf-8") as f:
+            json.dump(pending, f, ensure_ascii=False, indent=2)
+        print(f"  [SAVED] {bet_type}  prob {prob*100:.1f}%")
 
-    lines.append(f"  Исход:     {outcome}")
-    lines.append(f"  1Х/Х2:     1Х {r['p1']+r['draw']:.1%}  |  Х2 {r['p2']+r['draw']:.1%}")
+def btts_signal(btts_prob, h2h):
+    h2h_btts = h2h["btts_pct"] if h2h else 50
+    combined = round((btts_prob * 100 + h2h_btts) / 2, 1)
+    if combined >= 60:   level = "HIGH  ++++"
+    elif combined >= 45: level = "MED   +++"
+    else:                level = "LOW   ++"
+    return (f"  BTTS: model {btts_prob*100:.1f}%"
+            f"  H2H {h2h_btts}%"
+            f"  total {combined}%  [{level}]")
 
-    if zone == "РАВНОВЕСИЕ":
-        lines.append(f"  Тотал:     ТМ 3.5 ({r['tm35']:.1%})  [Зона равновесия]")
-    elif zone == "ДОМИНИРОВАНИЕ":
-        lines.append(f"  Тотал:     ТБ 1.5 ({r['tb15']:.1%})  [Зона доминирования]")
+def verdict(r, home, away, zone, blocks, h2h):
+    lines = []
+    if r["p1"] > 0.50:             outcome = f"P1 {home}"
+    elif r["p2"] > 0.50:           outcome = f"P2 {away}"
+    elif r["p1"]+r["draw"] > 0.65: outcome = "1X (P1 or Draw)"
+    elif r["p2"]+r["draw"] > 0.65: outcome = "X2 (P2 or Draw)"
+    else:                           outcome = "1X (P1 or Draw)"
+
+    lines.append(f"  Outcome:    {outcome}")
+    lines.append(f"  1X / X2:    1X {r['p1']+r['draw']:.1%}  |  X2 {r['p2']+r['draw']:.1%}")
+
+    if zone == "BALANCE":
+        lines.append(f"  Total:      TM 3.5 ({r['tm35']:.1%})  [Balance zone]")
+    elif zone == "DOMINATION":
+        lines.append(f"  Total:      TB 1.5 ({r['tb15']:.1%})  [Domination zone]")
     else:
         if r["tb25"] >= 0.55:
-            lines.append(f"  Тотал 2.5: ТБ 2.5 ({r['tb25']:.1%})")
+            lines.append(f"  Total 2.5:  TB 2.5 ({r['tb25']:.1%})")
         else:
-            lines.append(f"  Тотал 2.5: ТМ 2.5 ({1-r['tb25']:.1%})")
+            lines.append(f"  Total 2.5:  TM 2.5 ({1-r['tb25']:.1%})")
 
-    lines.append(f"  Счёт (топ-3):")
+    lines.append(btts_signal(r["btts"], h2h))
+    lines.append(f"  Top scores:")
     for i,j,p in r["top3"]:
-        lines.append(f"    {i}:{j} — {p:.1%}")
+        lines.append(f"    {i}:{j}  {p:.1%}")
 
-    hard_blocks = [b for b in blocks if b.startswith("⛔")]
-    if not hard_blocks:
+    hard = [b for b in blocks if b.startswith("STOP")]
+    if not hard:
         express = []
-        if r["tb15"] >= 0.72:
-            express.append(f"ТБ 1.5  КФ ~1.17  ({r['tb15']:.1%})")
-        if r["tm35"] >= 0.72:
-            express.append(f"ТМ 3.5  КФ ~1.17  ({r['tm35']:.1%})")
-        if r["btts"] >= 0.60:
-            express.append(f"BTTS    КФ ~1.85  ({r['btts']:.1%})")
+        if r["tb15"] >= 0.72: express.append(f"TB 1.5  odds ~1.17  ({r['tb15']:.1%})")
+        if r["tm35"] >= 0.72: express.append(f"TM 3.5  odds ~1.17  ({r['tm35']:.1%})")
+        if r["btts"] >= 0.60: express.append(f"BTTS    odds ~1.85  ({r['btts']:.1%})")
         if express:
-            lines.append(f"\n  ✅ ЭКСПРЕСС:")
+            lines.append(f"\n  ===== EXPRESS =====")
             for e in express:
-                lines.append(f"  -> {e}")
+                lines.append(f"    -> {e}")
     return "\n".join(lines)
 
 def analyze(matches, total_teams=24):
-    print("\n" + "="*62)
-    print("   ПРОГНОЗ v25.3 + H2H — ДАННЫЕ 2025-26")
-    print("="*62)
+    print("\n" + "="*60)
+    print("  FORECAST  v25.3 + H2H + SPLIT xG  |  2025-26")
+    print("="*60)
 
-    data = {}
+    if os.path.exists(PENDING_FILE):
+        os.remove(PENDING_FILE)
+
+    data   = {}
     needed = set(m[2] for m in matches)
     for league in needed:
         if league in LEAGUES:
             code, season = LEAGUES[league]
-            print(f"  Загружаем {league}...", end=" ", flush=True)
+            print(f"  Loading {league}...", end=" ", flush=True)
             try:
                 data[league] = load_league(code, season)
-                print(f"{len(data[league])} матчей ✓")
+                print(f"{len(data[league])} matches OK")
             except:
-                print("ОШИБКА")
+                print("ERROR")
 
     print()
     for match in matches:
@@ -299,48 +331,55 @@ def analyze(matches, total_teams=24):
         odds_x  = match[6] if len(match) > 6 else 3.20
         odds_p2 = match[7] if len(match) > 7 else 2.50
 
-        print("="*62)
-        print(f"  {home} vs {away}  [{league}]")
-        print(f"  Позиции: {pos_h} vs {pos_a}  |  КФ: {odds_p1} / {odds_x} / {odds_p2}")
+        print("-"*60)
+        print(f"  MATCH:  {home}  vs  {away}  [{league}]")
+        print(f"  POS: {pos_h} vs {pos_a}   ODDS: {odds_p1} / {odds_x} / {odds_p2}")
 
         if league not in data:
-            print(f"  ⛔ Лига не загружена\n")
+            print(f"  STOP: League not loaded\n")
             continue
 
-        df = data[league]
-        hs  = team_stats(df, home)
-        as_ = team_stats(df, away)
+        df  = data[league]
+        hs  = team_stats_split(df, home)
+        as_ = team_stats_split(df, away)
 
         if hs is None:
-            print(f"  ⚠ '{home}' не найден! Команды: {sorted(df['HomeTeam'].unique())}\n")
+            print(f"  WARN: '{home}' not found!\n"
+                  f"  Teams: {sorted(df['HomeTeam'].unique())}\n")
             continue
         if as_ is None:
-            print(f"  ⚠ '{away}' не найден! Команды: {sorted(df['HomeTeam'].unique())}\n")
+            print(f"  WARN: '{away}' not found!\n"
+                  f"  Teams: {sorted(df['HomeTeam'].unique())}\n")
             continue
 
-        # H2H
-        print(f"  Загружаем H2H...", end=" ", flush=True)
+        hh = hs["home"]
+        aa = as_["away"]
+        print(f"  HOME {home}:   att {hh['xg_for']}  def {hh['xg_ag']}  "
+              f"momentum {hh['momentum']}  ({hh['n_matches']} games)")
+        print(f"  AWAY {away}:  att {aa['xg_for']}  def {aa['xg_ag']}  "
+              f"momentum {aa['momentum']}  ({aa['n_matches']} games)")
+
+        print(f"  H2H loading...", end=" ", flush=True)
         h2h = get_h2h(home, away, league, df)
         if h2h:
-            print(f"{h2h['total']} встреч найдено")
-            print(f"  H2H: {home} {h2h['home_wins']}П / {h2h['draws']}Н / {h2h['away_wins']}П {away}")
-            print(f"  H2H счета: {' | '.join(h2h['matches'])}")
-            print(f"  H2H avg голов: {h2h['avg_goals']}  BTTS: {h2h['btts_pct']}%  ТБ2.5: {h2h['over25_pct']}%")
+            print(f"{h2h['total']} matches")
+            print(f"  H2H: {home} {h2h['home_wins']}W / {h2h['draws']}D / {h2h['away_wins']}W {away}")
+            print(f"  H2H scores: {' | '.join(h2h['matches'])}")
+            print(f"  H2H avg goals: {h2h['avg_goals']}   BTTS: {h2h['btts_pct']}%   Over2.5: {h2h['over25_pct']}%")
         else:
-            print(f"нет данных")
+            print("no data")
 
-        # xG с H2H корректировкой
-        home_xg = round((hs["xg_for"] + as_["xg_ag"]) / 2, 2)
-        away_xg = round((as_["xg_for"] + hs["xg_ag"]) / 2, 2)
+        hxg, axg = calc_xg_split(hs, as_)
         if h2h:
-            home_xg = round(home_xg + h2h["xg_adj"], 2)
-            away_xg = round(away_xg + h2h["xg_adj"], 2)
-        print(f"  xG (с H2H корр.): {home_xg} — {away_xg}")
+            hxg = max(round(hxg + h2h["xg_adj"], 2), 0.3)
+            axg = max(round(axg + h2h["xg_adj"], 2), 0.3)
 
-        r = predict(home_xg, away_xg)
-        print(f"  П1: {r['p1']:.1%}  Х: {r['draw']:.1%}  П2: {r['p2']:.1%}")
-        print(f"  BTTS: {r['btts']:.1%}  ТБ1.5: {r['tb15']:.1%}  ТБ2.5: {r['tb25']:.1%}  ТМ3.5: {r['tm35']:.1%}")
-        print(f"  Momentum: {home}={hs['momentum']}  {away}={as_['momentum']}")
+        print(f"  xG SPLIT: {hxg} vs {axg}  "
+              f"(home att {hh['xg_for']} x away def {aa['xg_ag']})")
+        r = predict(hxg, axg)
+        print(f"  P1: {r['p1']:.1%}   X: {r['draw']:.1%}   P2: {r['p2']:.1%}")
+        print(f"  Over1.5: {r['tb15']:.1%}   Over2.5: {r['tb25']:.1%}   Under3.5: {r['tm35']:.1%}")
+        print(f"  Momentum: {home}={hs['momentum']}   {away}={as_['momentum']}")
 
         blocks, zone = apply_filters(
             home, away, pos_h, pos_a, odds_p1, odds_p2,
@@ -348,26 +387,27 @@ def analyze(matches, total_teams=24):
         )
 
         if blocks:
-            print(f"\n  ФИЛЬТРЫ ПРОТОКОЛА:")
+            print(f"\n  PROTOCOL FILTERS:")
             for b in blocks:
-                print(f"  {b}")
+                print(f"    {b}")
 
-        hard = [b for b in blocks if b.startswith("⛔")]
+        hard = [b for b in blocks if b.startswith("STOP")]
         if hard:
-            print(f"\n  🚫 МАТЧ ЗАБЛОКИРОВАН ПРОТОКОЛОМ\n")
+            print(f"\n  [BLOCKED] MATCH BLOCKED BY PROTOCOL\n")
         else:
-            print(f"\n  РЕКОМЕНДАЦИЯ:")
-            print(verdict(r, home, away, zone, blocks))
+            print(f"\n  [OK] RECOMMENDATION:")
+            print(verdict(r, home, away, zone, blocks, h2h))
+            auto_save_bet(home, away, league, r, odds_x)
             print()
 
-    print("="*62)
-    print("  Анализ завершён  |  Протокол v25.3 + H2H")
-    print("="*62)
+    print("="*60)
+    print("  Analysis complete  |  v25.3 + H2H + SPLIT xG")
+    print("="*60)
 
-# ══════════════════════════════════════════════
-# МАТЧИ НА СЕГОДНЯ
-# Формат: ("Хозяин", "Гость", "Лига", Поз_х, Поз_г, КФ_П1, КФ_Х, КФ_П2)
-# ══════════════════════════════════════════════
+# ============================================================
+# TODAY'S MATCHES
+# Format: ("Home", "Away", "League", Pos_H, Pos_A, Odds_P1, Odds_X, Odds_P2)
+# ============================================================
 matches = [
     ("Birmingham",      "QPR",             "Championship", 13, 14, 1.95, 3.40, 3.80),
     ("Norwich",         "Sheffield United", "Championship", 12, 11, 2.10, 3.20, 3.50),
